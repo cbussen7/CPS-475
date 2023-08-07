@@ -1,0 +1,215 @@
+/* Simple ChatServer in GoLang by Phu Phung, customized by Christopher Bussen for ChatServer in SecAD*/
+package main
+
+import (
+	"fmt"
+	"net"
+	"os"
+	"strings"
+	"encoding/json"
+)
+
+const BUFFERSIZE int = 1024
+var AllClient_conns = make(map[net.Conn]string) // global
+var newclient = make(chan net.Conn)
+var lostclient = make(chan net.Conn)
+var allLoggedIn_conns = make(map[net.Conn]interface{})
+type User struct{
+	Username string
+	Login bool
+	Key string //to store the key
+}
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Printf("Usage: %s <port>\n", os.Args[0])
+		os.Exit(0)
+	}
+	port := os.Args[1]
+	if len(port) > 5 {
+		fmt.Println("Invalid port value. Try again!")
+		os.Exit(1)
+	}
+	server, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		fmt.Printf("Cannot listen on port '" + port + "'!\n")
+		os.Exit(2)
+	}
+	fmt.Println("ChatServer in GoLang developed by Phu Phung, SecAD, revised by Christopher Bussen")
+	fmt.Printf("ChatServer is listening on port '%s' ...\n", port)
+	go func(){
+		for{
+			client_conn, _ := server.Accept()
+			newclient <- client_conn
+		}
+	}()
+	for{
+		select{
+			case client_conn := <- newclient:
+				AllClient_conns[client_conn] = client_conn.RemoteAddr().String()
+				welcomemessage :=fmt.Sprintf("\nA new client is connected from '%s'. Waiting for login!\n", 
+					client_conn.RemoteAddr().String())
+				fmt.Println(welcomemessage)
+				// if(login(client_conn)){
+				go client_goroutine(client_conn)
+			case client_conn := <- lostclient:
+				delete(AllClient_conns,client_conn)
+				byemessage := fmt.Sprintf("A client '%s' DISCONNECTED!", client_conn.RemoteAddr().String())
+				fmt.Println(byemessage)
+		}
+	}
+}
+
+func client_goroutine(client_conn net.Conn){
+	var buffer [BUFFERSIZE]byte
+	// loggedin := login(client_conn)
+	// fmt.Printf("loggedin: %s", loggedin)
+	login(client_conn)
+	user := allLoggedIn_conns[client_conn].(User)
+
+	for {
+		byte_received, read_err := client_conn.Read(buffer[0:])
+		if read_err != nil {
+			lostclient <- client_conn
+			fmt.Println("Error in receiving...")
+			return
+		}
+
+		//userlist functionality
+		bufferString := string(buffer[0:byte_received])
+		userInput := strings.Split(bufferString, ":")
+		if(strings.Compare(bufferString,".userlist")==0){
+			userlist := userList(client_conn)
+			users := strings.Join(userlist, " ")
+			fmt.Printf("\nSent data: user list to '%s'", user.Username)
+			sendto(client_conn, []byte(users))
+		}else if(strings.Compare(userInput[0], "To")==0){  //private chat functionality
+				for client_conn, _ := range allLoggedIn_conns{
+					currentuser := allLoggedIn_conns[client_conn].(User)
+					if(strings.Compare(userInput[1], currentuser.Username)==0){
+						fmt.Printf("\nSent data: Private message to '%s': %s\n", userInput[1],userInput[2])
+						sendto(client_conn, []byte("Private message from " + user.Username + ":" + userInput[2]))
+					}
+				}
+				// sendto(client_conn, []byte("Invalid username"))
+		}else{ //public chat to all logged in users
+			for client_conn, _ := range allLoggedIn_conns{
+				sendto(client_conn, []byte("Public message from " + user.Username + ":" + bufferString))
+			}
+			fmt.Printf("\nSent data: Public message from '%s': %s\n", user.Username,buffer)
+		}
+	}
+}
+
+func checklogin(data []byte) (bool, string, string){
+	//expecting format of {"username":"..","password":".."}
+	type Account struct{
+		Username string
+		Password string
+	}
+	var account Account
+	err := json.Unmarshal(data, &account)
+	// fmt.Printf("Received login data: %s", data)
+	// fmt.Printf(account.Username)
+	if err!=nil || account.Username == "" || account.Password == "" {
+		fmt.Printf("JSON parsing error: %s\n", err)
+		return false, "", `[BAD LOGIN] Expected: {"Username":"..","Password":".."}`
+	}
+	fmt.Printf("\nDEBUG << Got: account=%s\n", account)
+	fmt.Printf("DEBUG << Got: username=%s, password=%s\n", account.Username,account.Password)
+
+	if checkaccount(account.Username,account.Password) {
+		return true, account.Username, "logged"
+	}
+
+	return false, "" , "Invalid username or password\n"
+}
+
+func checkaccount(username string, password string) bool {
+	if username == "bussenc" && password == "password"{
+		return true
+	}
+	if username == "bussenc1" && password == "password"{
+		return true
+	}
+	if username == "testuser" && password == "password"{
+		return true
+	}
+	return false
+}
+
+func login(client_conn net.Conn) bool{
+	var buffer [BUFFERSIZE]byte
+	byte_received, read_err := client_conn.Read(buffer[0:])
+	if read_err != nil{
+		fmt.Println("Error in receiving...")
+		if _, client_authenticated := AllClient_conns[client_conn]; client_authenticated{
+			lostclient <- client_conn
+		}else{
+			fmt.Println("An unauthenticated client is DISCONNECTED!")
+		}
+		return false
+	}
+	logindata := buffer[0:byte_received]
+	fmt.Printf("Received data: %s, len=%d\n", logindata, len(logindata))
+	authenticated, username, loginmessage := checklogin(logindata)
+	if authenticated {
+		fmt.Println("DEBUG << Username and password found! User '" + username + "' is successfully logged in!")
+
+		currentLoggedUser := User{ Username : username, Login: true}
+		allLoggedIn_conns[client_conn] = currentLoggedUser
+
+		fmt.Printf("Online users: ")
+		userlist := userList(client_conn)
+		users := strings.Join(userlist, " ")
+
+		newLoginMessage := fmt.Sprintf("New user '%s' logged in to Chat System from %s. Online users: %s", 
+			username, client_conn.RemoteAddr().String(), users)
+
+		for client_conn, _ := range allLoggedIn_conns{
+			sendto(client_conn, []byte(newLoginMessage))
+		}
+
+		chatWelcomeMessage := fmt.Sprintf("\nYou have logged in successfully with username %s.\n Welcome to the Chat System. Type anything to send to public chat.", username)
+		sendto(client_conn, []byte(chatWelcomeMessage))
+		optionsMessage := fmt.Sprintf("\nType 'To:Receiver:Message' to send to a specific user.\nType .userlist to request online users.\nType .exit to logout and close the connection.\n")
+		sendto(client_conn, []byte(optionsMessage))
+
+		return true
+	}else{
+		fmt.Println("DEBUG << Non-login data. Error message: " + loginmessage)
+		sendto(client_conn,[]byte(loginmessage))
+		login(client_conn)
+	}
+	return false
+}
+
+func sendto(client_conn net.Conn, data []byte){
+	_, write_err := client_conn.Write(data)
+		if write_err != nil {
+			fmt.Println("Error in sending... to" + client_conn.RemoteAddr().String())
+			return
+		}
+
+}
+
+func sendtoAll(data []byte){
+	for client_conn, _ := range AllClient_conns{
+		_, write_err := client_conn.Write(data)
+		if write_err != nil {
+			fmt.Println("Error in sending...")
+			continue //move on next iteration
+		}
+	}
+	fmt.Printf("Received data: %s Sent to all connected clients!\n", data)
+}
+
+func userList(client_conn net.Conn) []string{
+	var userlist []string
+	for client_conn, _ := range AllClient_conns{
+		user := allLoggedIn_conns[client_conn].(User)
+		fmt.Printf("%s ", user.Username)
+		userlist=append(userlist, user.Username)
+	}
+	return userlist
+}
